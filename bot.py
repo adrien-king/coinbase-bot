@@ -1,190 +1,193 @@
 import os
-import logging
+import json
 import uuid
+import logging
 
 from flask import Flask, request, jsonify
-from coinbase.rest import RESTClient
+import requests
 
-# -------------------------------------------------------------------
-# Logging
-# -------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
-log = logging.getLogger(__name__)
+# Coinbase CDP JWT helper
+from cdp.auth.utils.jwt import generate_jwt, JwtOptions
 
-# -------------------------------------------------------------------
-# Config from environment
-# -------------------------------------------------------------------
-API_KEY = os.getenv("COINBASE_API_KEY")
-API_SECRET = os.getenv("COINBASE_API_SECRET")
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-DEFAULT_PRODUCT_ID = os.getenv("DEFAULT_PRODUCT_ID", "ABT-USDC")
-DEFAULT_POSITION_USD = float(os.getenv("DEFAULT_POSITION_USD", "1.0"))
-PORT = int(os.getenv("PORT", "10000"))
+# === ENV VARS ===
+# These come from the Coinbase key you already created
+CB_KEY_NAME = os.getenv("CB_KEY_NAME")          # API key name (organizations/.../apiKeys/...)
+CB_KEY_SECRET = os.getenv("CB_KEY_SECRET")      # The full private key block
 
-if not API_KEY or not API_SECRET:
-    log.warning("COINBASE_API_KEY or COINBASE_API_SECRET not set – bot will fail to trade.")
+# Default product and position size
+DEFAULT_PRODUCT_ID = os.getenv("DEFAULT_PRODUCT_ID", "SOL-USD")
+POSITION_USD = float(os.getenv("POSITION_USD", "5"))   # default $5 per trade
 
-# -------------------------------------------------------------------
-# Coinbase client helpers
-# -------------------------------------------------------------------
-def create_cb_client() -> RESTClient:
+COINBASE_HOST = "api.coinbase.com"
+
+
+def build_jwt(method: str, path: str) -> str:
     """
-    Create a Coinbase Advanced Trade REST client using classic
-    api_key + api_secret (this is what your 10:14 buy used).
+    Build a short-lived JWT for a single Coinbase API request.
     """
-    log.info("Creating Coinbase RESTClient with api_key only (Advanced Trade style).")
-    client = RESTClient(API_KEY, API_SECRET)  # api_key, api_secret
-    return client
+    if not CB_KEY_NAME or not CB_KEY_SECRET:
+        raise RuntimeError("CB_KEY_NAME or CB_KEY_SECRET not set in environment variables.")
 
-
-def place_market_buy_usd(product_id: str, quote_size_usd: float):
-    """
-    Market BUY using a USD quote size.
-    This matches exactly the order that succeeded at 10:14.
-    """
-    client = create_cb_client()
-    client_order_id = str(uuid.uuid4())
-
-    log.info(
-        "Placing MARKET BUY: product_id=%s, quote_size=%s, client_order_id=%s",
-        product_id,
-        quote_size_usd,
-        client_order_id,
+    options = JwtOptions(
+        api_key_id=CB_KEY_NAME,
+        api_key_secret=CB_KEY_SECRET,
+        request_method=method,
+        request_host=COINBASE_HOST,
+        request_path=path,
+        expires_in=120,  # 2 minutes
     )
 
-    order_cfg = {
-        "market_market_ioc": {
-            "quote_size": str(quote_size_usd),
-        }
+    return generate_jwt(options)
+
+
+def coinbase_request(method: str, path: str, json_body: dict | None = None):
+    """
+    Generic helper to call Coinbase Advanced Trade REST API with JWT auth.
+    """
+    jwt_token = build_jwt(method, path)
+
+    url = f"https://{COINBASE_HOST}{path}"
+    headers = {
+        "Authorization": f"Bearer {jwt_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
-    order = client.create_order(
-        client_order_id,
-        product_id=product_id,
-        side="BUY",
-        order_configuration=order_cfg,
-    )
+    app.logger.info(f"Sending {method} {url} body={json_body}")
 
-    log.info("BUY order response: %s", order)
-    return order
+    resp = requests.request(method, url, headers=headers, json=json_body, timeout=10)
+    app.logger.info(f"Coinbase response {resp.status_code}: {resp.text}")
+
+    return resp
 
 
-def place_market_sell_all(product_id: str):
+def get_base_position_size(product_id: str) -> float:
     """
-    Sell ALL of the base currency in the product_id (e.g. ABT for ABT-USDC).
-    This is the minimal change we needed to make selling work.
+    Look up how much of the base asset (e.g. SOL in SOL-USD) is available.
+    We’ll use this to sell everything on an EXIT signal.
     """
-    client = create_cb_client()
     base_currency = product_id.split("-")[0]
 
-    log.info("Placing MARKET SELL ALL for product_id=%s (base=%s)", product_id, base_currency)
+    path = "/api/v3/brokerage/accounts"
+    resp = coinbase_request("GET", path)
 
-    try:
-        accounts_response = client.get_accounts()
-    except Exception as e:
-        log.exception("Error calling get_accounts(): %s", e)
-        raise
+    if not resp.ok:
+        app.logger.error(f"List accounts failed: {resp.status_code} {resp.text}")
+        return 0.0
 
-    # The SDK returns a ListAccountsResponse object with .accounts
-    accounts = getattr(accounts_response, "accounts", []) or []
-    log.info("DEBUG: Listing all accounts returned by Coinbase:")
-    for acct in accounts:
-        try:
-            avail = float(acct.available_balance.value)
-            log.info(
-                "  Account currency=%s, available=%s",
-                acct.currency,
-                avail,
-            )
-        except Exception:
-            log.info("  Account object: %s", acct)
+    data = resp.json()
+    for acct in data.get("accounts", []):
+        if acct.get("currency") == base_currency:
+            value = acct.get("available_balance", {}).get("value")
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
 
-    # Find the account for our base currency with positive balance
-    target = None
-    for acct in accounts:
-        try:
-            if acct.currency == base_currency:
-                avail = float(acct.available_balance.value)
-                if avail > 0:
-                    target = acct
-                    break
-        except Exception:
-            continue
+    return 0.0
 
-    if not target:
-        log.warning("No sellable account found for currency %s. Nothing to sell.", base_currency)
-        return {"status": "no_position"}
 
-    base_size = float(target.available_balance.value)
+def place_market_buy(product_id: str, quote_size: float):
+    """
+    Place a MARKET IOC BUY using quote_size (e.g. $5 of SOL-USD).
+    """
+    path = "/api/v3/brokerage/orders"
 
-    log.info(
-        "Found account for %s with available=%s. Placing market sell for full size.",
-        base_currency,
-        base_size,
-    )
-
-    client_order_id = str(uuid.uuid4())
-
-    order_cfg = {
-        "market_market_ioc": {
-            "base_size": str(base_size),
-        }
+    body = {
+        "client_order_id": str(uuid.uuid4()),
+        "product_id": product_id,
+        "side": "BUY",
+        "order_configuration": {
+            "market_market_ioc": {
+                "quote_size": f"{quote_size:.2f}"
+            }
+        },
     }
 
-    order = client.create_order(
-        client_order_id,
-        product_id=product_id,
-        side="SELL",
-        order_configuration=order_cfg,
-    )
-
-    log.info("SELL order response: %s", order)
-    return order
+    return coinbase_request("POST", path, body)
 
 
-# -------------------------------------------------------------------
-# Flask app
-# -------------------------------------------------------------------
-app = Flask(__name__)
+def place_market_sell_full(product_id: str):
+    """
+    Sell the full available base position for this product_id.
+    """
+    size = get_base_position_size(product_id)
+    if size <= 0:
+        app.logger.warning(f"No {product_id.split('-')[0]} available to sell.")
+        return None
+
+    path = "/api/v3/brokerage/orders"
+
+    body = {
+        "client_order_id": str(uuid.uuid4()),
+        "product_id": product_id,
+        "side": "SELL",
+        "order_configuration": {
+                "market_market_ioc": {
+                    "base_size": f"{size:.8f}"
+                }
+        },
+    }
+
+    return coinbase_request("POST", path, body)
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return "OK", 200
+    return "Bot is running!", 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """
-    TradingView sends JSON like:
-    { "signal": "BUY_SIGNAL", "product_id": "ABT-USDC" }
+    TradingView will POST JSON here.
+
+    Example for BUY:
+    {
+      "signal": "BUY_SIGNAL",
+      "product_id": "SOL-USD"
+    }
+
+    Example for EXIT:
+    {
+      "signal": "EXIT_SIGNAL",
+      "product_id": "SOL-USD"
+    }
+
+    If product_id is missing, DEFAULT_PRODUCT_ID is used.
     """
-    try:
-        payload = request.get_json(force=True, silent=True) or {}
-        log.info("Incoming webhook payload: %s", payload)
+    data = request.get_json(force=True, silent=True) or {}
 
-        signal = (payload.get("signal") or "").upper()
-        product_id = payload.get("product_id") or DEFAULT_PRODUCT_ID
+    app.logger.info(f"Incoming webhook: {data}")
 
-        if signal == "BUY_SIGNAL":
-            result = place_market_buy_usd(product_id, DEFAULT_POSITION_USD)
-            return jsonify({"status": "buy_sent", "result": str(result)}), 200
+    signal = (data.get("signal") or data.get("action") or "").upper()
+    product_id = data.get("product_id") or DEFAULT_PRODUCT_ID
 
-        elif signal == "EXIT_SIGNAL":
-            result = place_market_sell_all(product_id)
-            return jsonify({"status": "sell_sent", "result": str(result)}), 200
+    if signal == "":
+        return jsonify({"error": "Missing 'signal' or 'action' in JSON"}), 400
 
-        else:
-            log.warning("Unknown signal: %s", signal)
-            return jsonify({"error": "unknown_signal", "signal": signal}), 400
+    if signal in ("BUY_SIGNAL", "BUY", "LONG"):
+        resp = place_market_buy(product_id, POSITION_USD)
+        if resp is None:
+            return jsonify({"status": "error", "message": "Buy failed"}), 500
+        return jsonify({"status": "ok", "side": "BUY", "product_id": product_id}), 200
 
-    except Exception as e:
-        log.exception("Error handling webhook: %s", e)
-        return jsonify({"error": "server_error", "details": str(e)}), 500
+    elif signal in ("EXIT_SIGNAL", "SELL", "CLOSE"):
+        resp = place_market_sell_full(product_id)
+        if resp is None:
+            return jsonify({
+                "status": "no_position",
+                "message": f"No available {product_id.split('-')[0]} to sell."
+            }), 200
+        return jsonify({"status": "ok", "side": "SELL", "product_id": product_id}), 200
+
+    else:
+        return jsonify({"error": f"Unknown signal: {signal}"}), 400
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    # For local testing only
+    app.run(host="0.0.0.0", port=5000)
