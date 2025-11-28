@@ -1,255 +1,236 @@
 import os
-import json
 import logging
-from typing import List, Tuple, Any, Optional
-
 from flask import Flask, request, jsonify
 from coinbase.rest import RESTClient
 
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
 # Logging setup
-# ---------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
-logger = logging.getLogger("__main__")
+# -------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------
-# Environment
-# ---------------------------------------------------------
-CB_KEY_NAME = os.environ.get("CB_KEY_NAME", "").strip()
-CB_KEY_SECRET = os.environ.get("CB_KEY_SECRET", "").strip()
-
-DEFAULT_PRODUCT_ID = os.environ.get("DEFAULT_PRODUCT_ID", "SOL-USDC").strip()
-DEFAULT_POSITION_USD = float(os.environ.get("DEFAULT_POSITION_USD", "1.0"))
-
-PORT = int(os.environ.get("PORT", "10000"))
-
-if not CB_KEY_NAME or not CB_KEY_SECRET:
-    logger.error("Missing CB_KEY_NAME or CB_KEY_SECRET in environment.")
-else:
-    logger.info("BOT starting up with config:")
-    logger.info("  CB_KEY_NAME: %s", CB_KEY_NAME)
-    logger.info("  DEFAULT_PRODUCT_ID: %s", DEFAULT_PRODUCT_ID)
-    logger.info("  DEFAULT_POSITION_USD: %s", DEFAULT_POSITION_USD)
-    logger.info("  PORT: %s", PORT)
-
-# ---------------------------------------------------------
-# Coinbase client
-# ---------------------------------------------------------
-client = RESTClient(
-    api_key=CB_KEY_NAME,
-    api_secret=CB_KEY_SECRET,
-)
-
-# ---------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------
-def list_accounts_with_balances() -> List[Tuple[str, float, Any]]:
+# -------------------------------------------------------------------
+# Environment & Coinbase client
+# -------------------------------------------------------------------
+def create_cb_client() -> RESTClient:
     """
-    Return list of (currency, available, raw_account_obj)
-    using the official ListAccountsResponse model.
+    Create a Coinbase Advanced REST client from environment variables.
+    Tries a few possible env var names for the private key so it works
+    with the different names you've used.
     """
-    results: List[Tuple[str, float, Any]] = []
-    try:
-        resp = client.get_accounts()
-        logger.info("Raw ListAccountsResponse from Coinbase: %s", resp)
-
-        # The SDK returns a Pydantic model; the accounts live on resp.accounts
-        accounts = getattr(resp, "accounts", None)
-
-        if not accounts:
-            logger.warning("get_accounts() returned no accounts.")
-            return results
-
-        for acc in accounts:
-            try:
-                currency = getattr(acc, "currency", None)
-
-                # available_balance is usually a Money dict/model with "value"
-                available_obj = getattr(acc, "available_balance", None)
-                available_val: Optional[float] = None
-
-                if available_obj is not None:
-                    # New SDKs use .value; older might use ['value']
-                    value = getattr(available_obj, "value", None)
-                    if value is None and isinstance(available_obj, dict):
-                        value = available_obj.get("value")
-                    if value is not None:
-                        available_val = float(value)
-                else:
-                    # very old models might have acc.available
-                    maybe = getattr(acc, "available", None)
-                    if maybe is not None:
-                        available_val = float(maybe)
-
-                logger.info(
-                    "Account currency=%s, available=%s, raw=%s",
-                    currency,
-                    available_val,
-                    acc,
-                )
-                if currency and available_val is not None:
-                    results.append((currency, available_val, acc))
-            except Exception as inner:
-                logger.warning("Error parsing single account: %s", inner)
-
-    except Exception as e:
-        logger.exception("Error listing accounts: %s", e)
-
-    return results
-
-
-def find_base_currency_account(product_id: str) -> Tuple[Optional[str], float]:
-    """
-    For a product like 'ABT-USDC', find the base currency account (ABT)
-    and return (currency, available).
-    """
-    base = product_id.split("-")[0]
-    accounts = list_accounts_with_balances()
-    for currency, available, _raw in accounts:
-        if currency == base:
-            logger.info(
-                "Matched base currency account: %s, available=%s", currency, available
-            )
-            return currency, available
-    logger.warning("No account found for base currency %s.", base)
-    return None, 0.0
-
-
-def place_market_buy(product_id: str, quote_size_usd: float):
-    """
-    Place a MARKET BUY with a fixed quote size (USDC amount).
-    """
-    logger.info(
-        "Placing MARKET BUY; product_id=%s, quote_size=%.4f",
-        product_id,
-        quote_size_usd,
+    cb_key_name = (
+        os.getenv("CB_KEY_NAME")
+        or os.getenv("CB_API_KEY_NAME")
+        or os.getenv("CB_API_KEY")
     )
 
-    order_cfg = {
-        "market_market_ioc": {
-            "quote_size": str(quote_size_usd),
-        }
+    private_key = (
+        os.getenv("CB_PRIVATE_KEY")
+        or os.getenv("CB_KEY_SECRET")
+        or os.getenv("Private_key")
+    )
+
+    if not cb_key_name:
+        raise RuntimeError("Missing CB_KEY_NAME / CB_API_KEY_NAME / CB_API_KEY in environment")
+    if not private_key:
+        raise RuntimeError("Missing CB_PRIVATE_KEY / CB_KEY_SECRET / Private_key in environment")
+
+    logger.info("Creating Coinbase RESTClient with CB_KEY_NAME=%s", cb_key_name)
+    # DO NOT log the private key!
+
+    # Coinbase Advanced Trade client (Developer Platform)
+    client = RESTClient(api_key=cb_key_name, private_key=private_key)
+    return client
+
+
+# Global client
+client = create_cb_client()
+
+# Trading defaults
+DEFAULT_PRODUCT_ID = os.getenv("DEFAULT_PRODUCT_ID", "ABT-USDC")
+DEFAULT_POSITION_USD = float(os.getenv("DEFAULT_POSITION_USD", os.getenv("POSITION_USD", "1.0")))
+PORT = int(os.getenv("PORT", "10000"))
+
+logger.info("BOT config -> DEFAULT_PRODUCT_ID=%s, DEFAULT_POSITION_USD=%s, PORT=%s",
+            DEFAULT_PRODUCT_ID, DEFAULT_POSITION_USD, PORT)
+
+# -------------------------------------------------------------------
+# Flask app
+# -------------------------------------------------------------------
+app = Flask(__name__)
+
+# -------------------------------------------------------------------
+# Helper functions for trading
+# -------------------------------------------------------------------
+def place_market_buy(product_id: str, quote_usd: float):
+    """
+    Place a MARKET BUY using quote_size in USD/USDC.
+    """
+    logger.info("Placing MARKET BUY: product_id=%s, quote_size=%s", product_id, quote_usd)
+
+    body = {
+        "product_id": product_id,
+        "side": "BUY",
+        "order_configuration": {
+            "market_market_ioc": {
+                "quote_size": str(quote_usd)
+            }
+        },
     }
 
-    try:
-        order = client.create_order(
-            product_id=product_id,
-            side="BUY",
-            order_configuration=order_cfg,
-        )
-        logger.info("BUY order response: %s", order)
-        return order
-    except Exception as e:
-        logger.exception("Error placing MARKET BUY: %s", e)
-        raise
+    logger.info("Buy order request body: %s", body)
+    order = client.create_order(**body)
+    logger.info("Buy order response: %s", order)
+    return order
 
 
 def place_market_sell_all(product_id: str):
     """
-    Sell ALL available base currency for the given product.
-    For ABT-USDC, find ABT account and use its available amount as base_size.
+    Sell ALL available base currency for the given product_id.
+    E.g. 'ABT-USDC' -> base = 'ABT'
     """
-    base_currency, available = find_base_currency_account(product_id)
+    base_currency = product_id.split("-")[0].upper()
+    logger.info("Placing MARKET SELL ALL for product_id=%s, base_currency=%s",
+                product_id, base_currency)
 
-    if base_currency is None or available <= 0:
-        logger.warning(
-            "No funds to sell for product %s (base %s). Nothing to do.",
-            product_id,
-            base_currency,
-        )
+    # List all accounts and find the one for the base currency
+    accounts_resp = client.get_accounts()
+    logger.info("DEBUG: ListAccountsResponse object: %s", accounts_resp)
+
+    accounts = getattr(accounts_resp, "data", [])
+    target_acct = None
+
+    for acct in accounts:
+        cur = getattr(acct, "currency", "")
+        avail_obj = getattr(acct, "available_balance", None)
+        avail_val = getattr(avail_obj, "value", None)
+        logger.info("Account currency=%s, available=%s", cur, avail_val)
+
+        if cur.upper() == base_currency:
+            target_acct = acct
+
+    if not target_acct:
+        logger.warning("No account found for currency %s. Nothing to sell.", base_currency)
         return None
 
-    # Safety: tiny dust can cause errors; ignore < 0.00000001
-    if available < 1e-8:
-        logger.warning(
-            "Available balance for %s is essentially zero (%.12f). Skipping sell.",
-            base_currency,
-            available,
-        )
+    available_str = getattr(target_acct.available_balance, "value", "0")
+    try:
+        available = float(available_str)
+    except Exception:
+        logger.warning("Could not parse available balance '%s' for %s", available_str, base_currency)
         return None
 
-    base_size = round(available, 8)
-    logger.info(
-        "Placing MARKET SELL ALL; product_id=%s, base_currency=%s, base_size=%s",
-        product_id,
-        base_currency,
-        base_size,
-    )
+    if available <= 0:
+        logger.warning("Account %s has 0 available. Nothing to sell.", base_currency)
+        return None
 
-    order_cfg = {
-        "market_market_ioc": {
-            "base_size": str(base_size),
-        }
+    body = {
+        "product_id": product_id,
+        "side": "SELL",
+        "order_configuration": {
+            # NOTE: Some docs call this market_market_ioc; for base_size
+            # many examples use 'market_ioc'. If this fails, the error
+            # will show in the logs with the exact message from Coinbase.
+            "market_ioc": {
+                "base_size": str(available)
+            }
+        },
     }
 
-    try:
-        order = client.create_order(
-            product_id=product_id,
-            side="SELL",
-            order_configuration=order_cfg,
-        )
-        logger.info("SELL order response: %s", order)
-        return order
-    except Exception as e:
-        logger.exception("Error placing MARKET SELL: %s", e)
-        raise
+    logger.info("Sell order request body: %s", body)
+    order = client.create_order(**body)
+    logger.info("Sell order response: %s", order)
+    return order
 
 
-# ---------------------------------------------------------
-# Flask app
-# ---------------------------------------------------------
-app = Flask(__name__)
-
-
+# -------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------
 @app.route("/", methods=["GET"])
-def health():
-    return "OK", 200
+def root():
+    """
+    Simple root endpoint so you can hit the base URL in a browser
+    and confirm the bot is running.
+    """
+    return "Coinbase bot is running. Use /webhook for TradingView alerts.", 200
 
 
-@app.route("/webhook", methods=["POST"])
+@app.route("/webhook", methods=["GET", "POST"])
 def webhook():
+    """
+    Webhook endpoint:
+
+    - GET: simple health-check so you can open it in a browser and
+      confirm it's reachable (no more 405 confusion).
+
+    - POST: used by TradingView alerts. Expects JSON like:
+        {"signal":"BUY_SIGNAL", "product_id":"ABT-USDC"}
+        {"signal":"EXIT_SIGNAL","product_id":"ABT-USDC"}
+      Optional:
+        {"quote_usd": 5.0}  # override default position size
+    """
+    if request.method == "GET":
+        logger.info("Received GET /webhook (health check)")
+        return "Webhook endpoint is alive – send POST from TradingView.", 200
+
+    logger.info("Received POST /webhook")
+
+    # Try to parse JSON body
     try:
-        payload = request.get_json(force=True, silent=False)
+        data = request.get_json(force=True, silent=False)
     except Exception as e:
-        logger.exception("Failed to parse JSON from webhook: %s", e)
-        return jsonify({"status": "error", "reason": "invalid_json"}), 400
+        logger.exception("ERROR parsing JSON from webhook")
+        logger.info("Raw body: %s", request.data)
+        return jsonify({"status": "error", "reason": "invalid json"}), 400
 
-    logger.info("Incoming webhook payload: %s", payload)
+    logger.info("Incoming webhook payload: %s", data)
 
-    if not isinstance(payload, dict):
-        return jsonify({"status": "error", "reason": "payload_not_dict"}), 400
+    # Extract fields safely
+    signal = str(data.get("signal", "")).upper()
+    product_id = str(data.get("product_id", "") or DEFAULT_PRODUCT_ID).upper()
 
-    signal = payload.get("signal")
-    product_id = payload.get("product_id", DEFAULT_PRODUCT_ID) or DEFAULT_PRODUCT_ID
+    # Allow an override of position size from TradingView; otherwise use default
+    quote_usd_raw = data.get("quote_usd", DEFAULT_POSITION_USD)
+    try:
+        quote_usd = float(quote_usd_raw)
+    except Exception:
+        logger.warning("Could not parse quote_usd '%s', falling back to DEFAULT_POSITION_USD=%s",
+                       quote_usd_raw, DEFAULT_POSITION_USD)
+        quote_usd = DEFAULT_POSITION_USD
 
-    if not signal:
-        return jsonify({"status": "error", "reason": "missing_signal"}), 400
+    logger.info("Parsed signal=%s, product_id=%s, quote_usd=%s",
+                signal, product_id, quote_usd)
 
+    # Act on the signal
     try:
         if signal == "BUY_SIGNAL":
-            order = place_market_buy(product_id, DEFAULT_POSITION_USD)
-            return jsonify({"status": "ok", "action": "buy", "product_id": product_id}), 200
+            logger.info("Handling BUY_SIGNAL")
+            place_market_buy(product_id, quote_usd)
 
         elif signal == "EXIT_SIGNAL":
-            order = place_market_sell_all(product_id)
-            return jsonify({"status": "ok", "action": "sell_all", "product_id": product_id}), 200
+            logger.info("Handling EXIT_SIGNAL")
+            place_market_sell_all(product_id)
 
         else:
-            logger.warning("Unknown signal: %s", signal)
-            return jsonify({"status": "error", "reason": "unknown_signal"}), 400
+            logger.warning("Unknown signal '%s' – ignoring.", signal)
+            return jsonify({"status": "ignored", "reason": "unknown signal"}), 200
 
     except Exception as e:
-        logger.exception("Error handling webhook: %s", e)
-        return jsonify({"status": "error", "reason": "internal_exception"}), 500
+        logger.exception("Error while placing order for signal=%s", signal)
+        return jsonify({"status": "error", "reason": str(e)}), 500
+
+    return jsonify({"status": "ok"}), 200
 
 
-# ---------------------------------------------------------
-# Local run (Render still uses your start.sh)
-# ---------------------------------------------------------
+# -------------------------------------------------------------------
+# Main entrypoint
+# -------------------------------------------------------------------
 if __name__ == "__main__":
-    # Useful if you ever run it locally: python bot.py
-    logger.info("Starting Flask app on port %s", PORT)
-    app.run(host="0.0.0.0", port=PORT)
+    logger.info("BOT starting up with config:")
+    logger.info("  CB_KEY_NAME: %s", os.getenv("CB_KEY_NAME"))
+    # Do NOT log any private key
+    logger.info("  DEFAULT_PRODUCT_ID: %s", DEFAULT_PRODUCT_ID)
+    logger.info("  DEFAULT_POSITION_USD: %s", DEFAULT_POSITION_USD)
+    logger.info("  PORT: %s", PORT)
+
+    app.run(host="0.0.0.0", port=PORT, debug=False)
