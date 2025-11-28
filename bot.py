@@ -1,249 +1,235 @@
 import os
+import json
 import logging
-import time
+from time import sleep
 
 from flask import Flask, request, jsonify
+from requests.exceptions import RequestException
 from coinbase.rest import RESTClient
-import requests
 
-# ------------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # Logging setup
-# ------------------------------------------------------------------------------
-
-logging.basicConfig(level=logging.INFO)
+# ---------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s"
+)
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------------------
-# Config from environment variables
-# ------------------------------------------------------------------------------
-
-CB_KEY_NAME = os.environ.get("CB_KEY_NAME")
+# ---------------------------------------------------------------------
+# Environment / Coinbase client
+# ---------------------------------------------------------------------
+CB_KEY_NAME   = os.environ.get("CB_KEY_NAME")
 CB_KEY_SECRET = os.environ.get("CB_KEY_SECRET")
-DEFAULT_PRODUCT_ID = os.environ.get("DEFAULT_PRODUCT_ID", "SOL-USDC")
-POSITION_USD = float(os.environ.get("POSITION_USD", "1"))  # $ size per trade
 
 if not CB_KEY_NAME or not CB_KEY_SECRET:
-    logger.warning("CB_KEY_NAME or CB_KEY_SECRET not set! Coinbase client will fail.")
+    raise RuntimeError("CB_KEY_NAME and CB_KEY_SECRET must be set as environment variables.")
 
-# Coinbase Advanced REST client
+# Default product & position size (in QUOTE currency, e.g. USDC)
+DEFAULT_PRODUCT_ID = os.environ.get("DEFAULT_PRODUCT_ID", "ABT-USDC").upper()
+POSITION_USD       = float(os.environ.get("POSITION_USD", "1.0"))
+
+logger.info("Using DEFAULT_PRODUCT_ID=%s POSITION_USD=%s", DEFAULT_PRODUCT_ID, POSITION_USD)
+
 client = RESTClient(api_key=CB_KEY_NAME, api_secret=CB_KEY_SECRET)
 
-# Flask app
-app = Flask(__name__)
-
-# ------------------------------------------------------------------------------
-# Helper: retry wrapper for Coinbase calls
-# ------------------------------------------------------------------------------
-
-def with_retries(func, *args, retries=3, delay=0.5, **kwargs):
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+def debug_list_accounts(accounts):
     """
-    Run func with retries on network errors.
+    Log all accounts & available balances for the current portfolio.
+    This is the debug step that shows what the bot can actually see.
     """
-    for attempt in range(1, retries + 1):
+    logger.info("===== DEBUG: Listing all accounts returned by Coinbase =====")
+    for acct in accounts:
         try:
-            return func(*args, **kwargs)
-        except requests.exceptions.RequestException as e:
-            logger.warning(
-                f"Network error on {func.__name__}, attempt {attempt}/{retries}: {e}"
-            )
-            if attempt == retries:
-                raise
-            time.sleep(delay)
+            cur   = acct["currency"]
+            avail = acct["available_balance"]["value"]
         except Exception:
-            # For unexpected errors, don't retry by default
-            raise
+            # In case library changes format
+            logger.info("Raw account object: %s", acct)
+            continue
 
-# ------------------------------------------------------------------------------
-# Health endpoint
-# ------------------------------------------------------------------------------
+        logger.info("Account currency=%s, available=%s", cur, avail)
+    logger.info("============================================================")
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Coinbase bot is running", 200
 
-# ------------------------------------------------------------------------------
-# Coinbase order helpers
-# ------------------------------------------------------------------------------
-
-def place_market_buy(product_id: str, quote_size_usd: float):
+def get_accounts_with_retry(max_attempts: int = 3, delay_sec: float = 1.0):
     """
-    Place a MARKET BUY using quote_size (USDC / USD side of the pair).
-    Example product_id: 'ABT-USDC', 'SOL-USDC', 'BTC-USD'
+    Fetch accounts with simple retry logic for transient network issues.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            accounts = client.get_accounts()
+            return accounts
+        except RequestException as e:
+            logger.warning(
+                "Network error on get_accounts attempt %d/%d: %s",
+                attempt, max_attempts, e
+            )
+            sleep(delay_sec)
+
+    raise RuntimeError("Failed to fetch accounts from Coinbase after retries.")
+
+
+def place_market_buy(product_id: str, quote_size: float):
+    """
+    Place a MARKET BUY using quote_size in the quote currency
+    (e.g. $1 USDC of ABT-USDC).
     """
     logger.info(
-        f"Placing MARKET BUY: product_id={product_id}, quote_size={quote_size_usd}"
+        "Placing MARKET BUY: product_id=%s, quote_size=%s",
+        product_id, quote_size
     )
 
-    order = with_retries(
-        client.market_order_buy,
-        client_order_id="",       # let Coinbase generate one
-        product_id=product_id,
-        quote_size=str(quote_size_usd),
-    )
+    order_req = {
+        "product_id": product_id,
+        "side": "BUY",
+        "order_configuration": {
+            "market_market_ioc": {
+                "quote_size": str(quote_size)
+            }
+        },
+    }
 
-    logger.info(f"Buy order response: {order.to_dict()}")
-    return order
+    for attempt in range(1, 4):
+        try:
+            resp = client.create_order(**order_req)
+            logger.info("Buy order response: %s", resp)
+            return resp
+        except RequestException as e:
+            logger.warning(
+                "Network error on BUY attempt %d/3: %s",
+                attempt, e
+            )
+            sleep(1.0)
+
+    raise RuntimeError("Failed to place BUY order after retries.")
 
 
 def place_market_sell_all(product_id: str):
     """
-    Sell ALL available balance of the base asset in product_id.
-    Example: product_id 'ABT-USDC' -> base asset 'ABT'
+    Sell ALL available base currency for the given product.
+    Example: product_id='ABT-USDC' → sell all ABT into USDC.
     """
-    base_currency = product_id.split("-")[0]
+    base, quote = product_id.split("-")
     logger.info(
-        f"Placing MARKET SELL for all holdings in {base_currency}, product_id={product_id}"
+        "Placing MARKET SELL for all holdings in %s, product_id=%s",
+        base, product_id
     )
 
-    # Get all accounts with retries
-    accounts = with_retries(client.get_accounts)
+    # 1) Get portfolio accounts
+    accounts = get_accounts_with_retry()
 
-    # Coinbase Advanced SDK returns an object with an 'accounts' attribute
-    all_accounts = getattr(accounts, "accounts", accounts)
+    # 2) Debug: log everything we see
+    debug_list_accounts(accounts)
 
-    # DEBUG: dump all accounts so we can see what Coinbase returns
-    try:
-        logger.info("DEBUG: Listing all accounts returned by Coinbase:")
-        for acct in all_accounts:
-            cur = getattr(acct, "currency", None)
-            available_value = None
-            if hasattr(acct, "available_balance"):
-                bal = acct.available_balance
-                # bal is usually a dict-like: {'value': '...', 'currency': '...'}
-                if isinstance(bal, dict):
-                    available_value = bal.get("value")
-                else:
-                    # Some SDK versions wrap it differently
-                    available_value = getattr(bal, "value", None)
-            logger.info(f"  Account currency={cur}, available={available_value}")
-    except Exception as e:
-        logger.warning(f"DEBUG: Failed to log accounts: {e}")
-
-    # Find the base currency account
-    base_account = None
-    for acct in all_accounts:
-        if getattr(acct, "currency", None) == base_currency:
-            base_account = acct
+    # 3) Find the base asset account (e.g. ABT)
+    base_acct = None
+    for acct in accounts:
+        if acct.get("currency") == base:
+            base_acct = acct
             break
 
-    if not base_account:
-        logger.warning(f"No account found for currency {base_currency}. Nothing to sell.")
-        return None
-
-    # Extract available balance
-    bal = base_account.available_balance
-    if isinstance(bal, dict):
-        available_str = bal.get("value", "0")
-    else:
-        available_str = getattr(bal, "value", "0")
-
-    try:
-        available = float(available_str)
-    except (TypeError, ValueError):
+    if not base_acct:
         logger.warning(
-            f"Could not parse available balance for {base_currency}: {available_str}"
+            "WARNING: No account found for currency %s. Nothing to sell.",
+            base
         )
         return None
 
-    logger.info(f"Available {base_currency} balance: {available}")
+    available_str = base_acct["available_balance"]["value"]
+    available = float(available_str)
 
     if available <= 0:
-        logger.warning(f"Balance for {base_currency} is zero. Nothing to sell.")
+        logger.warning(
+            "WARNING: Account %s has 0 available. Nothing to sell.",
+            base
+        )
         return None
 
-    order = with_retries(
-        client.market_order_sell,
-        client_order_id="",
-        product_id=product_id,
-        base_size=str(available),   # sell entire available base balance
-    )
+    logger.info("Base currency %s available to sell: %s", base, available_str)
 
-    logger.info(f"Sell order response: {order.to_dict()}")
-    return order
+    order_req = {
+        "product_id": product_id,
+        "side": "SELL",
+        "order_configuration": {
+            "market_market_ioc": {
+                "base_size": f"{available:.8f}"  # sell everything we see
+            }
+        },
+    }
 
-# ------------------------------------------------------------------------------
-# Webhook endpoint for TradingView alerts
-# ------------------------------------------------------------------------------
+    for attempt in range(1, 4):
+        try:
+            resp = client.create_order(**order_req)
+            logger.info("Sell order response: %s", resp)
+            return resp
+        except RequestException as e:
+            logger.warning(
+                "Network error on SELL attempt %d/3: %s",
+                attempt, e
+            )
+            sleep(1.0)
 
-def parse_webhook_payload():
-    """
-    Try to parse TradingView webhook payload as JSON.
-    TradingView usually sends exactly what you put in the "Message" box.
-    """
-    data = request.get_json(force=True, silent=True)
-    if isinstance(data, dict):
-        return data
+    raise RuntimeError("Failed to place SELL order after retries.")
 
-    # If JSON parsing fails, try raw text
-    try:
-        raw = request.data.decode("utf-8").strip()
-        logger.info(f"Raw webhook payload (non-JSON): {raw}")
-    except Exception:
-        raw = None
 
-    return {} if data is None else data
+# ---------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------
+app = Flask(__name__)
+
+
+@app.route("/", methods=["GET"])
+def healthcheck():
+    return "coinbase-bot is running", 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """
-    TradingView should send JSON like:
-
-    { "signal": "BUY_SIGNAL",  "product_id": "ABT-USDC" }
-    { "signal": "EXIT_SIGNAL", "product_id": "ABT-USDC" }
-
-    If product_id is missing, DEFAULT_PRODUCT_ID is used.
+    TradingView sends:
+        {
+          "signal": "BUY_SIGNAL" or "EXIT_SIGNAL",
+          "product_id": "ABT-USDC"    (optional, falls back to DEFAULT_PRODUCT_ID)
+        }
     """
     try:
-        payload = parse_webhook_payload()
-    except Exception as e:
-        logger.exception("Failed to parse webhook payload")
-        return "Invalid JSON", 400
+        payload = request.get_json(force=True, silent=False)
+    except Exception:
+        logger.exception("Failed to parse JSON payload.")
+        return jsonify({"status": "error", "detail": "invalid JSON"}), 400
 
-    logger.info(f"Incoming webhook payload: {payload}")
+    logger.info("Incoming webhook payload: %s", payload)
 
     if not isinstance(payload, dict):
-        return "Payload must be a JSON object", 400
+        return jsonify({"status": "error", "detail": "payload must be an object"}), 400
 
     signal = payload.get("signal")
-    product_id = payload.get("product_id") or DEFAULT_PRODUCT_ID
+    product_id = payload.get("product_id", DEFAULT_PRODUCT_ID).upper()
 
     if signal not in ("BUY_SIGNAL", "EXIT_SIGNAL"):
-        logger.warning(f"Unknown signal: {signal}")
-        return "Unknown signal", 400
+        logger.warning("Unknown or missing signal: %s", signal)
+        return jsonify({"status": "ignored", "detail": "unknown signal"}), 200
 
     try:
         if signal == "BUY_SIGNAL":
-            order = place_market_buy(product_id, POSITION_USD)
-            return jsonify(
-                {
-                    "status": "ok",
-                    "action": "buy",
-                    "product_id": product_id,
-                    "order": order.to_dict() if order else None,
-                }
-            ), 200
+            place_market_buy(product_id, POSITION_USD)
+        else:  # EXIT_SIGNAL
+            place_market_sell_all(product_id)
 
-        elif signal == "EXIT_SIGNAL":
-            order = place_market_sell_all(product_id)
-            return jsonify(
-                {
-                    "status": "ok",
-                    "action": "sell",
-                    "product_id": product_id,
-                    "order": order.to_dict() if order else None,
-                }
-            ), 200
+        return jsonify({"status": "ok"}), 200
 
     except Exception as e:
-        logger.exception("Error while placing order")
-        return "Error while placing order", 500
+        logger.exception("Error while handling webhook")
+        return jsonify({"status": "error", "detail": str(e)}), 500
 
-# ------------------------------------------------------------------------------
-# Local run (Render uses gunicorn via start.sh)
-# ------------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------
+# Local run (Render uses start.sh, but this keeps it runnable anywhere)
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
-    # For local testing
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=False)
