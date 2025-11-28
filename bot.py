@@ -51,11 +51,10 @@ def place_market_sell_all(product_id: str):
     logger.info("Placing MARKET SELL ALL for base currency %s on %s",
                 base_currency, product_id)
 
-    # List all accounts in this portfolio
     accounts = client.get_accounts()
-    held_account = None
 
     logger.info("=== DEBUG: Accounts with non-zero balance in this portfolio ===")
+    held_account = None
     for acct in accounts["accounts"]:
         cur = acct["currency"]
         avail = float(acct["available_balance"]["value"])
